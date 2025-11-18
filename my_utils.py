@@ -1040,5 +1040,5 @@ def predictAll():
     final_str += ","
     final_str += ",".join(str(v) for v in peak_day_flags)
 
-    print(header_str)
+    
     print(final_str)
