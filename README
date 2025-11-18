@@ -1,7 +1,0 @@
-stats604fa25proj4
-
-Note that the file 'data/pjm/hrl_load_metered_fresh.csv' will be updated daily.
-
-Link to use to download: https://raw.githubusercontent.com/SurtaiHan/stats604fa25proj4/refs/heads/main/data/pjm/hrl_load_metered_fresh.csv
-
-Note that all times are stored in timezone-aware UTC. Features (e.g. is_holiday) were constructed using the EPT time.
