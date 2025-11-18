@@ -35,4 +35,4 @@ COPY . /app
 
 # 6. Define the command to run your application
 # This is the entry point when the container starts.
-CMD ["make"]
+#CMD ["make"]

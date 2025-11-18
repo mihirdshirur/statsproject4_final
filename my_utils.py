@@ -173,13 +173,14 @@ def checkInconsistencies():
 def getYears():
     return range(2018,2026)
 
-def getWeatherDf(load_area, force_refresh=False, verbose=False):
+# the flag recent_only_no_cache is used when constructing the test-time df
+def getWeatherDf(load_area, recent_only_no_cache=False, force_refresh=False, verbose=False):
     # Create a Nominatim geocoder instance for the desired country (For the USA, use 'us')
     nomi = pgeocode.Nominatim('us')
     years = getYears()
     # First check if we have the information cached
     file_path = getWeatherFilePath(load_area)
-    if os.path.exists(file_path) and not force_refresh:
+    if os.path.exists(file_path) and not force_refresh and not recent_only_no_cache:
         temp = pd.read_csv(file_path)
         temp['time'] = pd.to_datetime(temp['time'])
         temp = temp.set_index('time')
@@ -197,10 +198,19 @@ def getWeatherDf(load_area, force_refresh=False, verbose=False):
 
     location = Point(latitude, longitude)
     start = datetime.datetime(years[0], 1, 1)
+    if recent_only_no_cache:
+        # hardcoded but whatever. start in nov 1 to allow sufficient lagged features to accumulate
+        start = datetime.datetime(2025, 11, 1)
     end   = datetime.datetime(years[-1], 12, 31)
 
     data = Hourly(location, start, end, timezone='UTC').fetch()
     # df.index = df.index.tz_localize('UTC').tz_convert('America/New_York')
+
+    if recent_only_no_cache:
+        #print("Returning recent only no cache:")
+        #print(data)
+        return data
+
     data.to_csv(getWeatherFilePath(load_area))
     if verbose:
         print("Added new cached weather file for " + load_area + " using zip code:" + str(zip_code))
@@ -412,7 +422,7 @@ def getMidnight(num_days):
 
 def getPredictionFeatures(load_area):
     energy_df = getEnergyDf(load_area, force_refresh=True)
-    weather_df = getWeatherDf(load_area, force_refresh=True)
+    weather_df = getWeatherDf(load_area, recent_only_no_cache=True, force_refresh=True)
     prediction_df = add_features(energy_df, weather_df, dropna=False, outer=True)
 
     start = getMidnight(1)
@@ -438,6 +448,9 @@ def getPredictionFeatures(load_area):
     prediction_df['temp_lag_120'] = prediction_df['temp_lag_120'].fillna(prediction_df['temp_lag_144'])
     prediction_df['temp_lag_96'] = prediction_df['temp_lag_96'].fillna(prediction_df['temp_lag_120'])
     prediction_df['temp_lag_72'] = prediction_df['temp_lag_72'].fillna(prediction_df['temp_lag_96'])
+
+    #print("generated prediction_df:")
+    #print(prediction_df[["datetime_beginning_ept", "temp", "temp_lag_72","temp_lag_240"]])
 
     return prediction_df
 
@@ -974,10 +987,9 @@ def build_single_zone_line(current_date_str, test_df, output_txt_path, verbose=F
     values = [current_date_str] + loads_rounded.tolist() + [peak_hour, peak_day_flag]
     line = ",".join(str(v) for v in values)
 
-    with open(output_txt_path, "w") as f:
-        f.write(line + "\n")
-
     if verbose:
+        with open(output_txt_path, "w") as f:
+            f.write(line + "\n")
         print(f"Wrote single-zone line for {zone_name} to {output_txt_path}")
         print("Line content:")
         print(line)
