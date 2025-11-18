@@ -19,7 +19,7 @@ import re
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.linear_model import ElasticNetCV
+from sklearn.linear_model import ElasticNetCV, Ridge
 from sklearn.metrics import mean_squared_error
 from sklearn.ensemble import RandomForestRegressor
 
@@ -39,7 +39,7 @@ def getCompleteDfFilePath(load_area):
     return filepath
 
 def getModelFilePath(load_area):
-    filepath = "models/" + load_area + "_rf_model.pkl"
+    filepath = "models/" + load_area + "_ridge_model.pkl"
     return filepath
 
 def makeDirectories(verbose=False):
@@ -464,28 +464,32 @@ def get_feature_names_from_ct(preprocessor, cat_cols, num_cols):
 
 
 
-def save_rf_weights_pickle(rf_pipeline, cat_cols, num_cols, prefix):
+def save_ridge_weights_pickle(ridge_pipeline, cat_cols, num_cols, prefix):
     """
-    rf_pipeline: Pipeline([('prep', ...), ('rf', RandomForestRegressor(...))])
+    ridge_pipeline: Pipeline([('prep', ...), ('ridge', Ridge(...))])
     Saves:
-      - {prefix}_rf_importances.csv
-      - {prefix}_rf_model.pkl        <-- pickle instead of joblib
+      - {prefix}_ridge_coefs.csv
+      - {prefix}_ridge_intercept.txt
+      - {prefix}_ridge_model.pkl     <-- pickle instead of joblib
     """
     os.makedirs(os.path.dirname(prefix), exist_ok=True)
 
-    prep = rf_pipeline.named_steps["prep"]
-    rf = rf_pipeline.named_steps["rf"]
+    prep = ridge_pipeline.named_steps["prep"]
+    ridge = ridge_pipeline.named_steps["ridge"]
 
     feature_names = get_feature_names_from_ct(prep, cat_cols, num_cols)
-    importances = rf.feature_importances_
+    coefs = ridge.coef_
+    intercept = ridge.intercept_
 
-    imp_df = pd.DataFrame({"feature": feature_names, "importance": importances})
-    imp_df = imp_df.sort_values("importance", ascending=False)
-    imp_df.to_csv(f"{prefix}_rf_importances.csv", index=False)
+    coef_df = pd.DataFrame({"feature": feature_names, "coef": coefs})
+    coef_df.to_csv(f"{prefix}_ridge_coefs.csv", index=False)
+
+    with open(f"{prefix}_ridge_intercept.txt", "w") as f:
+        f.write(str(intercept))
 
     # Save full pipeline as pickle
-    with open(f"{prefix}_rf_model.pkl", "wb") as f:
-        pickle.dump(rf_pipeline, f)
+    with open(f"{prefix}_ridge_model.pkl", "wb") as f:
+        pickle.dump(ridge_pipeline, f)
 
 def split_time_series_with_gaps_df(
     df,
@@ -722,124 +726,72 @@ def trainRegion(region_name, force_refresh=False):
     print(f"  VAL   (B) rows: {val_df_B.shape[0]}")
     print(f"  TEST  (B) rows: {test_df_B.shape[0]}")
 
-    rf_pre = ColumnTransformer(
-    transformers=[
-        ("num", "passthrough", num_cols),
-        ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
-    ],
-    remainder="drop"
+    # Build transformer & model
+    pre = ColumnTransformer(
+        transformers=[
+            ("num", StandardScaler(), num_cols),
+            ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), cat_cols),
+        ],
+        remainder="drop"
     )
 
-    rf_model = Pipeline([
-        ("prep", rf_pre),
-        ("rf", RandomForestRegressor(
-            n_estimators=300,          # number of trees
-            max_depth=18,              # limit depth to reduce overfitting
-            min_samples_leaf=30,       # regularization; larger = smoother
-            n_jobs=-1,                 # use all cores
-            random_state=0,
-            oob_score=False            # can turn on if you want OOB estimates
-        ))
+    model = Pipeline([
+        ("prep", pre),
+        ("ridge", Ridge(alpha=10.0))
     ])
 
-    # ---- Fit on TRAIN_B, evaluate on VAL_B ----
-    Xtr_rf = train_df_B[cat_cols + num_cols]
-    ytr_rf = train_df_B[Y_COL].values
-    Xva_rf = val_df_B[cat_cols + num_cols]
-    yva_rf = val_df_B[Y_COL].values
+    # ---- Fit on TRAIN, evaluate on VAL ----
+    Xtr = train_df_B[cat_cols + num_cols]
+    ytr = train_df_B[Y_COL].values
+    Xva = val_df_B[cat_cols + num_cols]
+    yva = val_df_B[Y_COL].values
 
-    rf_model.fit(Xtr_rf, ytr_rf)
-    pred_val_rf = rf_model.predict(Xva_rf)
-    rmse_val_rf = np.sqrt(mean_squared_error(yva_rf, pred_val_rf))
-    print(f"\n[VAL] RMSE (Random Forest): {rmse_val_rf:0.3f}")
+    model.fit(Xtr, ytr)
+    pred_val = model.predict(Xva)
+    rmse_val = np.sqrt(mean_squared_error(yva, pred_val))
+    print(f"\n[VAL] RMSE (post-Lasso Ridge): {rmse_val:0.3f}")
 
-    # Compare against naive baselines again for context
-    """for h in (72, 168):
+    # Baselines (only if the cols exist, and drop NaNs rowwise)
+    def baseline_rmse(df_part, hours):
+        col = f"{Y_COL}_lag_{hours}"
+        if col in df_part.columns:
+            tmp = df_part[[Y_COL, col]].dropna()
+            if tmp.empty:
+                return None
+            return np.sqrt(mean_squared_error(tmp[Y_COL], tmp[col]))
+        return None
+
+    for h in (72, 168):
         r = baseline_rmse(val_df_B, h)
         if r is not None:
-            print(f"[VAL] Naive-{h} RMSE: {r:0.3f}")"""
+            print(f"[VAL] Naive-{h} RMSE: {r:0.3f}")
 
-    # ---- Refit on TRAIN_B + VAL_B, evaluate on TEST_B ----
-    trainval_df_rf = pd.concat([train_df_B, val_df_B], axis=0).sort_values(TIME_COL)
-    Xtva_rf = trainval_df_rf[cat_cols + num_cols]
-    ytva_rf = trainval_df_rf[Y_COL].values
-    Xte_rf  = test_df_B[cat_cols + num_cols]
-    yte_rf  = test_df_B[Y_COL].values
+    # ---- Refit on TRAIN+VAL, evaluate on TEST ----
+    trainval_df = pd.concat([train_df_B, val_df_B], axis=0).sort_values(TIME_COL)
+    Xtva = trainval_df[cat_cols + num_cols]
+    ytva = trainval_df[Y_COL].values
+    Xte  = test_df_B[cat_cols + num_cols]
+    yte  = test_df_B[Y_COL].values
 
-    rf_model.fit(Xtva_rf, ytva_rf)
-    pred_test_rf = rf_model.predict(Xte_rf)
-    rmse_test_rf = np.sqrt(mean_squared_error(yte_rf, pred_test_rf))
-    print(f"\n[TEST] RMSE (Random Forest): {rmse_test_rf:0.3f}")
+    model.fit(Xtva, ytva)
+    pred_test = model.predict(Xte)
+    rmse_test = np.sqrt(mean_squared_error(yte, pred_test))
+    print(f"\n[TEST] RMSE (post-Lasso Ridge): {rmse_test:0.3f}")
 
-    """for h in (72, 168):
+    for h in (72, 168):
         r = baseline_rmse(test_df_B, h)
         if r is not None:
-            print(f"[TEST] Naive-{h} RMSE: {r:0.3f}")"""
+            print(f"[TEST] Naive-{h} RMSE: {r:0.3f}")
 
-    # ---- Quick feature importance summary (grouped) ----
-    # (RF importance is in the model's internal feature space; we map back to names)
-
-    rf_prep = rf_model.named_steps["prep"]
-    rf = rf_model.named_steps["rf"]
-
-    # Get feature names in the order RF sees them
-    num_feature_names_rf = list(num_cols)
-
-    cat_encoder_rf = rf_prep.named_transformers_["cat"]
-    cat_feature_names_rf = []
-    for col_name, cats in zip(cat_cols, cat_encoder_rf.categories_):
-        for cat in cats:
-            cat_feature_names_rf.append(f"{col_name}={cat}")
-
-    full_feature_names_rf = num_feature_names_rf + cat_feature_names_rf
-
-    importances = rf.feature_importances_
-    rf_imp_df = pd.DataFrame({
-        "feature": full_feature_names_rf,
-        "importance": importances
-    }).sort_values("importance", ascending=False)
-
-    print("\nTop 20 Random Forest feature importances:")
-    print(rf_imp_df.head(20).to_string(index=False))
-
-    # Group by original feature (sum importance over its dummies)
-    rf_group_imp = (
-        rf_imp_df
-        .assign(group=lambda df: df["feature"].str.replace(r"=.*", "", regex=True))
-        .groupby("group")["importance"]
-        .sum()
-        .sort_values(ascending=False)
-    )
-
-    print("\nGroup-wise Random Forest feature importances:")
-    print(rf_group_imp.to_string())
-    # ----------------------------------------------------
-    # 1. Your existing preprocessing + split code goes here
-    #    It should define:
-    #      - train_df_B, val_df_B, test_df_B
-    #      - cat_cols, num_cols
-    #      - ridge_hourly_model (fitted)
-    #      - rf_hourly_model    (fitted)
-    # ----------------------------------------------------
-    #
-    # Example outline (you already have the detailed version):
-    #
-    # df = ensure_calendar(df)
-    # df = create_lags(df)  # however you built mw_lag_*, temp_lag_* etc.
-    # train_df, val_df, test_df = time_based_split(df)
-    # ... ENet feature selection ...
-    # train_df_B, val_df_B, test_df_B = drop_nans_on_needed_features(...)
-    # ridge_hourly_model.fit(train_df_B[cat_cols + num_cols], train_df_B[Y_COL])
-    # rf_hourly_model.fit(train_df_B[cat_cols + num_cols], train_df_B[Y_COL])
-    #
-    # ----------------------------------------------------
-
-    # 2. Save RF "weights" for this region
+    print("\nCategorical features used:", cat_cols)
+    print("Numeric (unpenalized + selected lags) used:", num_cols)
+   
+    # 2. Save Ridge "weights" for this region
     prefix = f"models/{region_name}"
 
-    save_rf_weights_pickle(rf_model, cat_cols, num_cols, prefix)
+    save_ridge_weights_pickle(model, cat_cols, num_cols, prefix)
 
-    print(f"Saved rf weights for {region_name} under prefix '{prefix}_*'")
+    print(f"Saved Ridge weights for {region_name} under prefix '{prefix}_*'")
 
 
 
@@ -859,10 +811,10 @@ LOAD_AREA_COL = "load_area"
 MODELS_DIR    = "models"
 
 
-def load_rf_model_for_zone(zone_name, base_dir=MODELS_DIR):
-    path = os.path.join(base_dir, f"{zone_name}_rf_model.pkl")
+def load_ridge_model_for_zone(zone_name, base_dir=MODELS_DIR):
+    path = os.path.join(base_dir, f"{zone_name}_ridge_model.pkl")
     if not os.path.exists(path):
-        raise FileNotFoundError(f"RF model not found at: {path}")
+        raise FileNotFoundError(f"Ridge model not found at: {path}")
     with open(path, "rb") as f:
         model = pickle.load(f)
     return model
@@ -953,7 +905,7 @@ def build_single_zone_line(current_date_str, test_df, output_txt_path, verbose=F
 
     Steps:
       - infer zone from load_area
-      - load correct RF model
+      - load correct Ridge model
       - ensure calendar cols (hour, dow, month)
       - drop columns not used by the model
       - impute mw_lag_* used by the model
@@ -983,8 +935,8 @@ def build_single_zone_line(current_date_str, test_df, output_txt_path, verbose=F
         print(f"Target date for this zone: {target_date}")
 
     # 3) Load model & get feature columns
-    rf_model = load_rf_model_for_zone(zone_name)
-    num_cols, cat_cols = get_feature_cols_from_pipeline(rf_model)
+    ridge_model = load_ridge_model_for_zone(zone_name)
+    num_cols, cat_cols = get_feature_cols_from_pipeline(ridge_model)
 
     # 4) Drop columns that are not used in prediction (keep only needed + minimal meta)
     keep_cols = set([TIME_COL, LOAD_AREA_COL, "hour", "dow", "month"]) | set(num_cols) | set(cat_cols)
@@ -998,7 +950,7 @@ def build_single_zone_line(current_date_str, test_df, output_txt_path, verbose=F
 
     # 7) Build design matrix and predict
     X = df[cat_cols + num_cols]
-    preds = rf_model.predict(X)
+    preds = ridge_model.predict(X)
 
     # Sort by hour so L_00..L_23 are in order
     tmp = pd.DataFrame({
