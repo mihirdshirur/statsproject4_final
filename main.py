@@ -75,7 +75,7 @@ def run_clean():
 
 def run_train():
     print("Running make (e.g. training models)...")
-    my_utils.trainAll()
+    my_utils.trainAll(force_refresh=True)
     print("Finished running make (e.g. training models)")
 
 def run_predictions():
